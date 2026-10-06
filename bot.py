@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import ChatMemberUpdated, Message
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,6 +19,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "stats.db")
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Vladivostok"))
 NO_SIGNATURE = "Без подписи"
+ADMIN_STATUSES = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
 
 router = Router()
 db: aiosqlite.Connection | None = None
@@ -68,6 +69,28 @@ async def init_db() -> None:
     await db.commit()
 
 
+async def save_channel(chat_id: int, title: str | None) -> None:
+    await db.execute(
+        "INSERT INTO channels (chat_id, title) VALUES (?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title",
+        (chat_id, title),
+    )
+    await db.commit()
+
+
+# ---------- Бота добавили в канал / убрали из канала ----------
+
+@router.my_chat_member(F.chat.type == ChatType.CHANNEL)
+async def on_bot_status_change(event: ChatMemberUpdated) -> None:
+    status = event.new_chat_member.status
+    if status == ChatMemberStatus.ADMINISTRATOR:
+        await save_channel(event.chat.id, event.chat.title)
+    elif status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        # Статистика остаётся в базе, но канал пропадает из списков
+        await db.execute("DELETE FROM channels WHERE chat_id = ?", (event.chat.id,))
+        await db.commit()
+
+
 # ---------- Подсчёт постов в канале ----------
 
 @router.channel_post()
@@ -109,28 +132,32 @@ async def cmd_start(message: Message) -> None:
     await message.answer(
         "Привет! Я считаю, сколько постов опубликовал каждый админ канала.\n\n"
         "<b>Настройка:</b>\n"
-        "1. Добавь меня в канал админом (право публикации не нужно, достаточно чтения).\n"
+        "1. Добавь меня в канал админом.\n"
         "2. В настройках канала включи «Подписывать сообщения» — иначе я не вижу, кто автор.\n\n"
         "<b>Команды:</b>\n"
-        "/channels — список каналов\n"
+        "/channels — каналы, где ты админ и я тоже\n"
         "/top [day|week|month|all] [id канала] — посты по админам\n"
-        "/total [day|week|month|all] [id канала] — всего постов"
+        "/total [day|week|month|all] [id канала] — всего постов\n\n"
+        "Без id канала команды покажут все твои каналы."
     )
 
 
-@router.message(Command("channels"), PRIVATE)
-async def cmd_channels(message: Message) -> None:
+async def get_admin_channels(bot: Bot, user_id: int) -> list[tuple[int, str | None]]:
+    """Каналы из базы, где данный пользователь — админ."""
     async with db.execute("SELECT chat_id, title FROM channels") as cur:
         rows = await cur.fetchall()
-    if not rows:
-        await message.answer("Пока нет каналов. Добавь меня в канал админом и опубликуй пост.")
-        return
-    lines = ["<b>Каналы:</b>"] + [f"{html.escape(t or '—')}: <code>{cid}</code>" for cid, t in rows]
-    await message.answer("\n".join(lines))
+    result = []
+    for chat_id, title in rows:
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+        except Exception:
+            continue  # бота убрали из канала или нет доступа
+        if member.status in ADMIN_STATUSES:
+            result.append((chat_id, title))
+    return result
 
 
-async def resolve_request(message: Message, command: CommandObject, bot: Bot):
-    """Возвращает (period_key, chat_id, title) или None, если ответ уже отправлен."""
+def parse_args(command: CommandObject) -> tuple[str, int | None]:
     key, chat_id = "day", None
     for arg in (command.args or "").split():
         if arg.lower() in PERIODS:
@@ -140,82 +167,94 @@ async def resolve_request(message: Message, command: CommandObject, bot: Bot):
                 chat_id = int(arg)
             except ValueError:
                 pass
+    return key, chat_id
 
-    async with db.execute("SELECT chat_id, title FROM channels") as cur:
-        channels = await cur.fetchall()
+
+async def pick_channels(message: Message, command: CommandObject, bot: Bot):
+    """Возвращает (period_key, [каналы]) или None, если ответ уже отправлен."""
+    key, wanted_id = parse_args(command)
+    channels = await get_admin_channels(bot, message.from_user.id)
+    if wanted_id is not None:
+        channels = [c for c in channels if c[0] == wanted_id]
     if not channels:
-        await message.answer("Пока нет данных. Добавь меня в канал админом и опубликуй пост.")
+        await message.answer(
+            "Не нашёл каналов, где ты админ и я тоже.\n"
+            "Добавь меня в канал админом, затем повтори команду."
+        )
         return None
+    return key, channels
 
-    if chat_id is None:
-        if len(channels) == 1:
-            chat_id = channels[0][0]
-        else:
-            await message.answer("Каналов несколько — укажи id: /top week -100123456789\nСписок: /channels")
-            return None
 
-    title = next((t for cid, t in channels if cid == chat_id), None)
-    if title is None and chat_id not in [c[0] for c in channels]:
-        await message.answer("Такого канала нет в моей базе.")
-        return None
+def where_clause(chat_id: int, key: str):
+    where, params = "chat_id = ?", [chat_id]
+    start = period_start(key)
+    if start:
+        where += " AND day >= ?"
+        params.append(start)
+    return where, params
 
-    # Статистику видят только админы канала
-    try:
-        member = await bot.get_chat_member(chat_id, message.from_user.id)
-    except Exception:
-        member = None
-    if not member or member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-        await message.answer("Статистику может смотреть только админ этого канала.")
-        return None
 
-    return key, chat_id, title
+@router.message(Command("channels"), PRIVATE)
+async def cmd_channels(message: Message, bot: Bot) -> None:
+    channels = await get_admin_channels(bot, message.from_user.id)
+    if not channels:
+        await message.answer(
+            "Не нашёл каналов, где ты админ и я тоже.\n"
+            "Добавь меня в канал админом, затем повтори команду."
+        )
+        return
+    lines = ["<b>Твои каналы:</b>"]
+    lines += [f"{html.escape(t or '—')}: <code>{cid}</code>" for cid, t in channels]
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("top"), PRIVATE)
 async def cmd_top(message: Message, command: CommandObject, bot: Bot) -> None:
-    resolved = await resolve_request(message, command, bot)
-    if not resolved:
+    picked = await pick_channels(message, command, bot)
+    if not picked:
         return
-    key, chat_id, title = resolved
+    key, channels = picked
 
-    query = "SELECT author, SUM(count) FROM stats WHERE chat_id = ?"
-    params: list = [chat_id]
-    start = period_start(key)
-    if start:
-        query += " AND day >= ?"
-        params.append(start)
-    query += " GROUP BY author ORDER BY SUM(count) DESC"
+    for chat_id, title in channels:
+        where, params = where_clause(chat_id, key)
+        async with db.execute(
+            f"SELECT author, SUM(count) FROM stats WHERE {where} "
+            "GROUP BY author ORDER BY SUM(count) DESC",
+            params,
+        ) as cur:
+            rows = await cur.fetchall()
 
-    async with db.execute(query, params) as cur:
-        rows = await cur.fetchall()
-    if not rows:
-        await message.answer("За этот период постов нет.")
-        return
-
-    total = sum(c for _, c in rows)
-    lines = [f"<b>{html.escape(title or 'Канал')} — посты {PERIODS[key][0]}:</b>"]
-    for i, (author, cnt) in enumerate(rows, 1):
-        lines.append(f"{i}. {html.escape(author)} — {cnt}")
-    lines.append(f"\nВсего: <b>{total}</b>")
-    await message.answer("\n".join(lines))
+        header = f"<b>{html.escape(title or 'Канал')} — посты {PERIODS[key][0]}:</b>"
+        if not rows:
+            await message.answer(f"{header}\nПостов нет.")
+            continue
+        lines = [header]
+        for i, (author, cnt) in enumerate(rows, 1):
+            lines.append(f"{i}. {html.escape(author)} — {cnt}")
+        lines.append(f"\nВсего: <b>{sum(c for _, c in rows)}</b>")
+        await message.answer("\n".join(lines))
 
 
 @router.message(Command("total"), PRIVATE)
 async def cmd_total(message: Message, command: CommandObject, bot: Bot) -> None:
-    resolved = await resolve_request(message, command, bot)
-    if not resolved:
+    picked = await pick_channels(message, command, bot)
+    if not picked:
         return
-    key, chat_id, title = resolved
+    key, channels = picked
 
-    query = "SELECT COALESCE(SUM(count), 0) FROM stats WHERE chat_id = ?"
-    params: list = [chat_id]
-    start = period_start(key)
-    if start:
-        query += " AND day >= ?"
-        params.append(start)
-    async with db.execute(query, params) as cur:
-        (cnt,) = await cur.fetchone()
-    await message.answer(f"{html.escape(title or 'Канал')}: <b>{cnt}</b> постов {PERIODS[key][0]}")
+    lines = [f"<b>Постов {PERIODS[key][0]}:</b>"]
+    grand_total = 0
+    for chat_id, title in channels:
+        where, params = where_clause(chat_id, key)
+        async with db.execute(
+            f"SELECT COALESCE(SUM(count), 0) FROM stats WHERE {where}", params
+        ) as cur:
+            (cnt,) = await cur.fetchone()
+        grand_total += cnt
+        lines.append(f"{html.escape(title or 'Канал')}: {cnt}")
+    if len(channels) > 1:
+        lines.append(f"\nВсего по всем каналам: <b>{grand_total}</b>")
+    await message.answer("\n".join(lines))
 
 
 async def main() -> None:
@@ -229,7 +268,9 @@ async def main() -> None:
     # Если у бота был включён вебхук, getUpdates не работает — снимаем его
     await bot.delete_webhook(drop_pending_updates=False)
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "channel_post"])
+        await dp.start_polling(
+            bot, allowed_updates=["message", "channel_post", "my_chat_member"]
+        )
     finally:
         await db.close()
 
