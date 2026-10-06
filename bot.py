@@ -226,6 +226,8 @@ async def main() -> None:
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+    # Если у бота был включён вебхук, getUpdates не работает — снимаем его
+    await bot.delete_webhook(drop_pending_updates=False)
     try:
         await dp.start_polling(bot, allowed_updates=["message", "channel_post"])
     finally:
